@@ -1,15 +1,21 @@
 """古籍残页转写拼接 API。
 
-提交两段含 "?"（未辨认字）的转写文本，将左段后缀与右段前缀做最优对齐，
-返回最高分对齐的原文区间、逐列对齐和拼接文本。
+- ``POST /api/align``：提交两段含 "?"（未辨认字）的转写文本，将左段后缀与
+  右段前缀做最优对齐，返回最高分对齐的原文区间、逐列对齐和拼接文本。
+- ``POST /api/assemble``：提交按阅读顺序排列的 2～5 段转写，逐段复用上述
+  后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
 """
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, model_validator
 
 from .aligner import align
+from .assembler import AssemblyError, assemble
 
-MAX_TEXT_LEN = 500  # 单段文本最大长度（残页转写通常远小于此）
+MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
+MAX_SEGMENTS = 5     # /api/assemble 最大段数
+MIN_SEGMENTS = 2     # /api/assemble 最小段数
+MAX_TOTAL_LEN = 800  # /api/assemble 各段总长上限
 
 app = FastAPI(
     title="古籍残页转写拼接 API",
@@ -94,11 +100,54 @@ class AlignResponse(BaseModel):
     resolved_wildcards: list[ResolvedWildcard] = Field(..., description="? 补字列表")
 
 
+class AssembleRequest(BaseModel):
+    """多段顺序拼接请求。"""
+
+    segments: list[str] = Field(
+        ...,
+        min_length=MIN_SEGMENTS,
+        max_length=MAX_SEGMENTS,
+        description="按阅读顺序排列的转写文本（2～5 段），未辨认字以 ? 表示",
+        examples=[["学而?习之", "时习之不", "之不亦乐乎"]],
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        for idx, seg in enumerate(self.segments):
+            if len(seg) < 1:
+                raise ValueError(f"第 {idx + 1} 段文本不能为空")
+            if len(seg) > MAX_TEXT_LEN:
+                raise ValueError(f"第 {idx + 1} 段文本超过 {MAX_TEXT_LEN} 字")
+        total = sum(len(seg) for seg in self.segments)
+        if total > MAX_TOTAL_LEN:
+            raise ValueError(f"各段文本总长 {total} 字，超过 {MAX_TOTAL_LEN} 字上限")
+        return self
+
+
+class CharSource(BaseModel):
+    """单个原始段对某输出字的来源标记（段序号、下标均从 0 开始）。"""
+
+    segment: int = Field(..., description="原始段序号（从 0 开始）")
+    pos: int = Field(..., description="该字在原始段中的下标（从 0 开始）")
+
+
+class AssembleResponse(BaseModel):
+    """多段顺序拼接结果。"""
+
+    text: str = Field(..., description="最终拼接文本")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="逐字来源列表，与 text 等长；每项保留贡献该字的所有原始段"
+                    "序号及原文下标（相同字、? 补字双方、异字冲突双方均保留）",
+    )
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
         "name": "古籍残页转写拼接 API",
         "align": "POST /api/align",
+        "assemble": "POST /api/assemble",
         "docs": "/docs",
         "health": "/health",
     }
@@ -121,3 +170,29 @@ def health():
 )
 def api_align(req: AlignRequest):
     return align(req.left, req.right)
+
+
+@app.post(
+    "/api/assemble",
+    response_model=AssembleResponse,
+    status_code=200,
+    summary="按阅读顺序逐段拼接 2～5 段残页转写",
+    description=(
+        "每段最长 500 字、总长最长 800 字。逐段复用后缀-前缀对齐：将当前拼接"
+        "文本与下一段合并。每一步仅在最高对齐得分大于 0、且至少有 2 对相同"
+        "已知字时继续；任一步不满足即返回 422 并指出失败段序号，不产生部分"
+        "结果。返回最终文本及与其等长的逐字来源列表，来源保留贡献该字的所有"
+        "原始段序号及原文下标（相同字、`?` 补字双方、异字冲突双方均保留）。"
+    ),
+)
+def api_assemble(req: AssembleRequest):
+    try:
+        return assemble(req.segments)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc

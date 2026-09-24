@@ -47,3 +47,71 @@ def test_empty_segment_rejected():
 def test_missing_field_rejected():
     resp = client.post("/api/align", json={"left": "abc"})
     assert resp.status_code == 422
+
+
+def test_assemble_endpoint():
+    resp = client.post(
+        "/api/assemble",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"]},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    sources = data["sources"]
+    assert len(sources) == len(data["text"]) == 9
+    # 相同字累积来源
+    assert sources[4] == [
+        {"segment": 0, "pos": 4},
+        {"segment": 1, "pos": 2},
+        {"segment": 2, "pos": 0},
+    ]
+    # "?" 补字双方来源保留
+    assert sources[2] == [{"segment": 0, "pos": 2}, {"segment": 1, "pos": 0}]
+
+
+def test_assemble_gate_failure_returns_422_with_segment_index():
+    resp = client.post(
+        "/api/assemble",
+        json={"segments": ["孔子曰未知", "未知生焉", "完全无关文本"]},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["failed_segment"] == 2
+
+
+def test_assemble_two_same_pairs_required():
+    # 仅一对相同字：422 且指出失败的是第 2 段（序号 1）
+    resp = client.post("/api/assemble", json={"segments": ["甲乙丙", "乙"]})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 1
+
+
+def test_assemble_too_few_or_many_segments_rejected():
+    resp = client.post("/api/assemble", json={"segments": ["abc"]})
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/assemble",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"]},
+    )
+    assert resp.status_code == 422
+
+
+def test_assemble_individual_segment_too_long_rejected():
+    resp = client.post(
+        "/api/assemble",
+        json={"segments": ["a" * 500, "b" * 501]},
+    )
+    assert resp.status_code == 422
+
+
+def test_assemble_total_too_long_rejected():
+    resp = client.post(
+        "/api/assemble",
+        json={"segments": ["字" * 400, "字" * 401]},
+    )
+    assert resp.status_code == 422
+
+
+def test_assemble_empty_segment_rejected():
+    resp = client.post("/api/assemble", json={"segments": ["abc", ""]})
+    assert resp.status_code == 422
